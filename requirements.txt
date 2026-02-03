@@ -1,0 +1,10 @@
+Flask
+python-dotenv
+requests
+beautifulsoup4
+mysql-connector-python
+APScheduler
+python-telegram-bot==13.15
+twilio
+google-generativeai
+pytz
