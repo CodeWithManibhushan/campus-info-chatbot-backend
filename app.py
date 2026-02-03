@@ -13,9 +13,15 @@ import os
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 from twilio.twiml.messaging_response import MessagingResponse
+import requests
+
+
+
+
 
 # Load environment
 load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # Database helper
 from modules.database import run_query
@@ -39,8 +45,39 @@ except Exception:
 
 # Flask app
 app = Flask(__name__)
+# ---------------- Telegram helper ----------------
+def send_telegram_message(chat_id, text):
+    if not TELEGRAM_TOKEN:
+        print("TELEGRAM_BOT_TOKEN missing")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Telegram send error:", e)
+
+# ---------------- Telegram buttons helper ----------------
+def send_telegram_buttons(chat_id, text, buttons):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": {
+            "inline_keyboard": buttons
+        }
+    }
+    requests.post(url, json=payload)
+
 
 # ---------------- Basic routes ----------------
+
 @app.route("/")
 def home():
     return "🎓 Campus Info Chatbot + Gemini AI + WhatsApp Integration is Running!"
@@ -489,6 +526,256 @@ def whatsapp_webhook():
         print("AI fallback error:", e)
         msg.body("⚠️ Sorry, AI seems busy right now. Please try again later.")
     return str(resp)
+
+# ---------------- Telegram Webhook ----------------
+@app.route("/telegram/webhook", methods=["POST"])
+def telegram_webhook():
+    update = request.get_json() or {}
+
+    try:
+        # --------------------------------
+        # 1) FIRST HANDLE CALLBACK QUERY
+        # --------------------------------
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            chat_id = cq["message"]["chat"]["id"]
+            data = cq["data"]
+# ---------------- TELEGRAM ALERT DELETE (INLINE) ----------------
+            if data.startswith("delalert_"):
+                alert_id = int(data.split("_")[1])
+
+                try:
+                    run_query(
+                        """
+                        DELETE FROM alerts
+                        WHERE id=%s AND user_identifier=%s AND channel='telegram'
+                        """,
+                        (alert_id, str(chat_id))
+                    )
+                    send_telegram_message(chat_id, f"✅ Alert {alert_id} deleted.")
+                except Exception as e:
+                    print("Telegram alert delete error:", e)
+                    send_telegram_message(chat_id, "⚠️ Failed to delete alert.")
+
+                return "OK", 200
+# ---------------- TELEGRAM FAQ HANDLER (INLINE) ----------------
+            # Category selected
+            if data.startswith("cat_"):
+                cat_id = int(data.split("_")[1])
+                qs = run_query(
+                    "SELECT id, question FROM faqs WHERE category_id=%s",
+                    (cat_id,),
+                    fetch=True
+                ) or []
+
+                if not qs:
+                    send_telegram_message(chat_id, "No questions in this category.")
+                    return "OK", 200
+
+                buttons = [
+                    [{"text": q["question"][:40], "callback_data": f"faq_{q['id']}"}]
+                    for q in qs
+                ]
+                buttons.append([{"text": "🔙 Back", "callback_data": "faq_back"}])
+
+                send_telegram_buttons(chat_id, "📝 Select a question:", buttons)
+                return "OK", 200
+
+            # Question selected
+            if data.startswith("faq_"):
+                faq_id = int(data.split("_")[1])
+                rows = run_query(
+                    "SELECT question, answer, category_id FROM faqs WHERE id=%s",
+                    (faq_id,),
+                    fetch=True
+                ) or []
+
+                if not rows:
+                    send_telegram_message(chat_id, "Answer not found.")
+                    return "OK", 200
+
+                q = rows[0]
+                buttons = [[{"text": "🔙 Back", "callback_data": f"cat_{q['category_id']}"}]]
+
+                send_telegram_buttons(
+                    chat_id,
+                    f"❓ {q['question']}\n\n✅ {q['answer']}",
+                    buttons
+                )
+                return "OK", 200
+
+            # Back
+            if data == "faq_back":
+                cats = run_query("SELECT id, name FROM faq_categories ORDER BY id", fetch=True) or []
+                buttons = [
+                    [{"text": c["name"], "callback_data": f"cat_{c['id']}"}]
+                    for c in cats
+                ]
+                send_telegram_buttons(chat_id, "📚 Choose a category:", buttons)
+                return "OK", 200
+
+        # --------------------------------
+        # 2) NOW HANDLE NORMAL TEXT MESSAGE
+        # --------------------------------
+        message = update.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        text = (message.get("text") or "").strip().lower()
+
+        if not chat_id:
+            return "OK", 200
+
+        # Start
+        if text in ("/start", "hi", "hello", "start"):
+            reply = (
+                "👋 Hello! I am the Campus Info Chatbot.\n\n"
+                "Commands:\n"
+                "• faq\n"
+                "• notices\n"
+                "• notices ptu\n"
+                "• notices gndec\n"
+                "• alert add <keyword> [source]\n"
+                "• myalerts\n"
+                "• delalert <id>\n"
+
+            )
+            send_telegram_message(chat_id, reply)
+            return "OK", 200
+
+        # FAQ
+        if text == "faq":
+            cats = run_query("SELECT id, name FROM faq_categories ORDER BY id", fetch=True) or []
+
+            if not cats:
+                send_telegram_message(chat_id, "No FAQ categories available.")
+                return "OK", 200
+
+            buttons = [
+                [{"text": c["name"], "callback_data": f"cat_{c['id']}"}] for c in cats
+            ]
+
+            send_telegram_buttons(chat_id, "📚 Choose a category:", buttons)
+            return "OK", 200
+
+        # Notices
+        if text.startswith("notices"):
+            parts = text.split()
+            source = None
+
+            if len(parts) == 2:
+                source = parts[1].upper()
+
+            if source:
+                rows = run_query(
+                    "SELECT title, link, date FROM notices WHERE source=%s ORDER BY date DESC LIMIT 5",
+                    (source,),
+                    fetch=True
+                )
+
+                if not rows:
+                    send_telegram_message(chat_id, f"No notices found for {source}.")
+                    return "OK", 200
+
+                reply = f"📢 Latest {source} Notices:\n\n"
+                for r in rows:
+                    reply += f"- {r['title']}\n{r['link']}\n{r['date']}\n\n"
+
+                send_telegram_message(chat_id, reply)
+                return "OK", 200
+
+            # Default 2-2 notices
+            ptu = run_query(
+                "SELECT title, link, date FROM notices WHERE source='PTU' ORDER BY date DESC LIMIT 2",
+                fetch=True
+            ) or []
+            gndec = run_query(
+                "SELECT title, link, date FROM notices WHERE source='GNDEC' ORDER BY date DESC LIMIT 2",
+                fetch=True
+            ) or []
+
+            reply = "📢 Latest Notices\n\n"
+
+            if ptu:
+                reply += "📘 PTU\n"
+                for r in ptu:
+                    reply += f"- {r['title']}\n{r['link']}\n{r['date']}\n\n"
+
+            if gndec:
+                reply += "📗 GNDEC\n"
+                for r in gndec:
+                    reply += f"- {r['title']}\n{r['link']}\n{r['date']}\n\n"
+
+            send_telegram_message(chat_id, reply)
+            return "OK", 200
+        # ---------------- TELEGRAM ALERT ADD ----------------
+        if text.startswith("alert add"):
+            parts = text.split()
+
+            if len(parts) < 3:
+                send_telegram_message(
+                    chat_id,
+                    "Usage:\nalert add <keyword> [source]\nExample:\nalert add admit_card GNDEC"
+                )
+                return "OK", 200
+
+            keyword = parts[2]
+            source = parts[3].upper() if len(parts) >= 4 else None
+
+            try:
+                run_query(
+                    """
+                    INSERT INTO alerts (user_identifier, channel, keyword, source, frequency)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (str(chat_id), "telegram", keyword, source, "immediate")
+                )
+                send_telegram_message(
+                    chat_id,
+                    f"✅ Alert created!\nKeyword: {keyword}\nSource: {source or 'ANY'}"
+                )
+            except Exception as e:
+                print("Telegram alert add error:", e)
+                send_telegram_message(chat_id, "⚠️ Failed to create alert.")
+
+            return "OK", 200
+
+
+        # ---------------- TELEGRAM MY ALERTS ----------------
+        if text == "myalerts":
+            rows = run_query(
+                """
+                SELECT id, keyword, source
+                FROM alerts
+                WHERE user_identifier=%s AND channel='telegram'
+                """,
+                (str(chat_id),),
+                fetch=True
+            ) or []
+
+            if not rows:
+                send_telegram_message(chat_id, "You have no alerts.")
+                return "OK", 200
+
+            reply = "🔔 Your Alerts:\n\n"
+            buttons = []
+
+            for r in rows:
+                reply += f"ID {r['id']} — '{r['keyword']}' ({r['source'] or 'ANY'})\n"
+                buttons.append([
+                    {"text": f"❌ Delete {r['id']}", "callback_data": f"delalert_{r['id']}"}
+                ])
+
+            send_telegram_buttons(chat_id, reply, buttons)
+            return "OK", 200
+
+        # fallback
+        send_telegram_message(chat_id, "Please type: faq / notices")
+        return "OK", 200
+
+    except Exception as e:
+        print("Telegram webhook error:", e)
+        return "OK", 200
+
+
 
 
 # ---------------- Run ----------------

@@ -1,6 +1,7 @@
 Flask
 python-dotenv
 requests
+gunicorn
 beautifulsoup4
 mysql-connector-python
 APScheduler
