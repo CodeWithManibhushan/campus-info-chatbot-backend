@@ -657,7 +657,8 @@ def telegram_webhook():
             return "OK", 200
 
         # Notices
-        if text.startswith("notices"):
+        text = text.strip()
+        if text.lower().startswith("notices"):
             parts = text.split()
             source = None
 
